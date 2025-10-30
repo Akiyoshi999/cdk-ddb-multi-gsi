@@ -2,50 +2,54 @@
 
 ## Core Type System and Interfaces
 
--   [ ] 1. Create missing GSI type definitions
+-   [x] 1. Create missing GSI type definitions
 
-    -   Create `lib/types/gsi-types.ts` with GSI configuration interfaces
-    -   Define GSIConfiguration, GSIInfo, AttributeDefinition, and ProjectionType interfaces
-    -   Ensure compatibility with DynamoDB API types
+    -   Create `lib/types/gsi-types.ts` with GSI configuration interfaces ✅
+    -   Define GSIConfiguration, GSIInfo, AttributeDefinition, and ProjectionType interfaces ✅
+    -   Ensure compatibility with DynamoDB API types (validation helper added) ✅
     -   _Design Reference: Data Models section_
 
--   [ ] 2. Complete GSI Manager construct props interface
-    -   Add GSIManagerProps interface to type exports
+-   [x] 2. Complete GSI Manager construct props interface
+    -   Add GSIManagerProps interface to type exports (error handling option added) ✅
     -   Define construct configuration options
     -   _Design Reference: Components and Interfaces section_
 
+-   [x] 2a. Move GSI configuration validation into the custom resource Lambda
+    -   Remove validation from construct layer ✅
+    -   Implement validation in Lambda handler before processing ✅
+
 ## DynamoDB Service Layer
 
--   [ ] 3. Implement DynamoDB GSI service
+-   [x] 3. Implement DynamoDB GSI service
 
-    -   [ ] 3.1 Create DynamoDB service class implementing DynamoDBGSIService interface
+    -   [x] 3.1 Create DynamoDB service class implementing DynamoDBGSIService interface ✅
 
-        -   Implement getCurrentGSIs method for retrieving current GSI state
-        -   Add table description parsing logic
+        -   Implement getCurrentGSIs method for retrieving current GSI state ✅
+        -   Add table description parsing logic ✅
         -   _Design Reference: DynamoDB Service Interface_
 
-    -   [ ] 3.2 Implement GSI lifecycle operations
+    -   [x] 3.2 Implement GSI lifecycle operations ✅
 
-        -   Add createGSI method with proper UpdateTable API calls
-        -   Implement deleteGSI method for GSI removal
-        -   Add updateGSI method for throughput updates
+        -   Add createGSI method with proper UpdateTable API calls ✅
+        -   Implement deleteGSI method for GSI removal ✅
+        -   Add updateGSI method for throughput updates ✅
         -   _Design Reference: Components and Interfaces section_
 
-    -   [ ] 3.3 Add GSI status monitoring
-        -   Implement waitForGSIStatus with polling logic
-        -   Add waitForTableStable method for operation sequencing
-        -   Include adaptive polling intervals
+    -   [x] 3.3 Add GSI status monitoring ✅
+        -   Implement waitForGSIStatus with polling logic ✅
+        -   Add waitForTableStable method for operation sequencing ✅
+        -   Include adaptive polling intervals ✅
         -   _Design Reference: Performance Optimizations section_
 
 ## Operation Planning and State Management
 
 -   [ ] 4. Create GSI operation planner
 
-    -   [ ] 4.1 Implement GSI diff calculation
+    -   [x] 4.1 Implement GSI diff calculation ✅
 
-        -   Compare current vs desired GSI configurations
-        -   Generate ordered list of required operations (create/update/delete)
-        -   Handle operation dependencies and sequencing
+        -   Compare current vs desired GSI configurations ✅
+        -   Generate ordered list of required operations (create/update/delete) ✅
+        -   Handle operation dependencies and sequencing ✅
         -   _Design Reference: Component Interaction Flow_
 
     -   [ ] 4.2 Add operation state tracking
@@ -64,51 +68,51 @@
         -   Implement error type detection logic
         -   _Design Reference: Error Categories section_
 
-    -   [ ] 5.2 Add retry mechanism with exponential backoff
-        -   Implement configurable retry logic with jitter
+    -   [x] 5.2 Add retry mechanism with exponential backoff ✅
+        -   Implement configurable retry logic with jitter ✅
         -   Add circuit breaker for consecutive failures
-        -   Include proper error propagation
+        -   Include proper error propagation ✅
         -   _Design Reference: Retry Logic section_
 
 ## Lambda Function Implementation
 
--   [ ] 6. Complete Lambda handler logic
+-   [x] 6. Complete Lambda handler logic
 
-    -   [ ] 6.1 Implement CloudFormation event processing
+    -   [x] 6.1 Implement CloudFormation event processing ✅
 
-        -   Parse CustomResourceEvent for Create/Update/Delete operations
-        -   Extract and validate resource properties
-        -   Handle PhysicalResourceId management
+        -   Parse CustomResourceEvent for Create/Update/Delete operations ✅
+        -   Extract and validate resource properties ✅
+        -   Handle PhysicalResourceId management ✅
         -   _Design Reference: Lambda Function Handler section_
 
-    -   [ ] 6.2 Add GSI management orchestration
+    -   [x] 6.2 Add GSI management orchestration ✅
 
-        -   Integrate DynamoDB service with operation planner
-        -   Implement sequential GSI operation execution
-        -   Add comprehensive error handling and rollback logic
+        -   Integrate DynamoDB service with operation planner ✅
+        -   Implement sequential GSI operation execution ✅
+        -   Add comprehensive error handling and rollback logic ✅
         -   _Design Reference: Component Interaction Flow_
 
-    -   [ ] 6.3 Implement CloudFormation response handling
-        -   Complete sendResponse function with proper HTTP calls
-        -   Add structured response formatting
-        -   Include operation results in response data
+    -   [x] 6.3 Implement CloudFormation response handling ✅
+        -   Complete sendResponse function with proper HTTP calls ⭐（Provider経由でハンドリング）
+        -   Add structured response formatting ✅
+        -   Include operation results in response data ✅
         -   _Design Reference: Lambda Function Handler section_
 
 ## CDK Construct Enhancement
 
--   [ ] 7. Enhance GSI Manager construct
+-   [x] 7. Enhance GSI Manager construct
 
-    -   [ ] 7.1 Complete construct implementation
+    -   [x] 7.1 Complete construct implementation ✅
 
-        -   Add proper GSI configuration validation
-        -   Implement resource property transformation
-        -   Add construct-level error handling
+        -   Add proper GSI configuration validation（handled in Lambda layer）
+        -   Implement resource property transformation ✅
+        -   Add construct-level error handling ✅
         -   _Design Reference: CDK Custom Resource Construct section_
 
-    -   [ ] 7.2 Add IAM permissions and security
-        -   Implement least-privilege IAM policies
-        -   Add resource-specific permissions
-        -   Include CloudWatch logging permissions
+    -   [x] 7.2 Add IAM permissions and security ✅
+        -   Implement least-privilege IAM policies ✅
+        -   Add resource-specific permissions ✅
+        -   Include CloudWatch logging permissions ✅
         -   _Design Reference: Security Considerations section_
 
 ## Build and Deployment Setup
