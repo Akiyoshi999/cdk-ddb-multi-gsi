@@ -8,6 +8,7 @@ import {
   validateGsiConfigurations,
   mergeErrorHandlingConfig,
   ErrorHandlingConfig,
+  OnEventResponse,
 } from "../../../lib/types/index.js";
 import { DynamoDBGSIServiceImpl } from "./dynamodb-gsi-service.js";
 import { planGsiOperations } from "./operation-planner.js";
@@ -373,6 +374,154 @@ export const handler = async (
       return handleCreateOrUpdate(event);
     case "Delete":
       return handleDelete(event);
+    default:
+      throw new Error("Unsupported request type");
+  }
+};
+
+// ===== Async Custom Resource Pattern Functions =====
+
+/**
+ * 操作を開始（待機なし）
+ */
+const startOperation = async (
+  tableName: string,
+  operation: GSIOperation,
+  service: DynamoDBGSIServiceImpl
+): Promise<void> => {
+  // テーブルがACTIVEになるまで待機（これは必須）
+  await service.waitForTableActive(tableName);
+
+  switch (operation.type) {
+    case "DELETE":
+      await service.deleteGSI(tableName, operation.indexName);
+      break;
+    case "CREATE":
+      if (!operation.desiredConfiguration) {
+        throw new Error(`CREATE operation missing desiredConfiguration for ${operation.indexName}`);
+      }
+      await service.createGSI(tableName, operation.desiredConfiguration);
+      break;
+    case "UPDATE":
+      if (!operation.desiredConfiguration) {
+        throw new Error(`UPDATE operation missing desiredConfiguration for ${operation.indexName}`);
+      }
+      await service.updateGSI(tableName, operation.desiredConfiguration);
+      break;
+  }
+
+  // 操作を開始したら即座に返す（GSIのステータス待機はしない）
+};
+
+const handleCreateOrUpdateAsync = async (
+  event: CloudFormationCustomResourceCreateEvent | CloudFormationCustomResourceUpdateEvent
+): Promise<OnEventResponse> => {
+  const props = parseProperties(event.ResourceProperties);
+  const errors = validateGsiConfigurations(props.globalSecondaryIndexes);
+  if (errors.length > 0) {
+    throw new Error(["Invalid GSI configuration detected:", ...errors].join("\n- "));
+  }
+
+  const errorHandling = mergeErrorHandlingConfig(props.errorHandling);
+  const service = new DynamoDBGSIServiceImpl({ client, errorHandling });
+
+  const managedNames = new Set(props.globalSecondaryIndexes.map((gsi) => gsi.indexName));
+  const current = await service.getCurrentGSIs(props.tableName);
+  const operations = planGsiOperations(
+    current.filter((gsi) => managedNames.has(gsi.indexName)),
+    props.globalSecondaryIndexes
+  );
+
+  if (operations.length === 0) {
+    // 操作が不要な場合は即座に完了
+    return {
+      IsComplete: true,
+      PhysicalResourceId: ensurePhysicalId(event),
+      Data: {
+        operationsExecuted: 0,
+        managedIndexes: props.globalSecondaryIndexes.map((gsi) => gsi.indexName).join(","),
+      },
+    };
+  }
+
+  // 最初の操作を開始（待機しない）
+  const firstOperation = operations[0];
+  await startOperation(props.tableName, firstOperation, service);
+
+  console.log(
+    `[GSI Manager][onEvent] Started operation ${firstOperation.type} for ${firstOperation.indexName}. ` +
+    `Total operations: ${operations.length}`
+  );
+
+  // IsComplete=false の場合は Data を返さない（CloudFormation Provider の制約）
+  return {
+    IsComplete: false,
+    PhysicalResourceId: ensurePhysicalId(event),
+  };
+};
+
+const handleDeleteAsync = async (
+  event: CloudFormationCustomResourceDeleteEvent
+): Promise<OnEventResponse> => {
+  const props = parseProperties(event.ResourceProperties);
+  const managedIndexes = new Set(
+    props.globalSecondaryIndexes.map((gsi) => gsi.indexName)
+  );
+
+  const service = new DynamoDBGSIServiceImpl({
+    client,
+    errorHandling: mergeErrorHandlingConfig(props.errorHandling),
+  });
+
+  const current = await service.getCurrentGSIs(props.tableName);
+  const targets = current.filter((gsi) => managedIndexes.has(gsi.indexName));
+
+  if (targets.length === 0) {
+    return {
+      IsComplete: true,
+      PhysicalResourceId: ensurePhysicalId(event),
+      Data: {
+        operationsExecuted: 0,
+        managedIndexes: Array.from(managedIndexes).join(","),
+      },
+    };
+  }
+
+  const operations = targets.map<GSIOperation>((gsi) => ({
+    type: "DELETE",
+    indexName: gsi.indexName,
+    currentConfiguration: gsi,
+  }));
+
+  // 最初の操作を開始（待機しない）
+  const firstOperation = operations[0];
+  await startOperation(props.tableName, firstOperation, service);
+
+  console.log(
+    `[GSI Manager][onEvent] Started DELETE operation for ${firstOperation.indexName}. ` +
+    `Total operations: ${operations.length}`
+  );
+
+  // IsComplete=false の場合は Data を返さない（CloudFormation Provider の制約）
+  return {
+    IsComplete: false,
+    PhysicalResourceId: ensurePhysicalId(event),
+  };
+};
+
+/**
+ * CloudFormation カスタムリソースの onEvent ハンドラー
+ * 操作を開始するが、完了を待たずに即座に返却
+ */
+export const onEventHandler = async (
+  event: CloudFormationCustomResourceEvent
+): Promise<OnEventResponse> => {
+  switch (event.RequestType) {
+    case "Create":
+    case "Update":
+      return handleCreateOrUpdateAsync(event);
+    case "Delete":
+      return handleDeleteAsync(event);
     default:
       throw new Error("Unsupported request type");
   }

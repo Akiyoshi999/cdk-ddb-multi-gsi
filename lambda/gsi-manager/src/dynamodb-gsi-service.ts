@@ -53,6 +53,14 @@ export interface DynamoDBGSIService {
     targetStatus: "ACTIVE" | "DELETED"
   ): Promise<void>;
   waitForTableActive(tableName: string): Promise<void>;
+
+  // Non-blocking status check methods for async custom resource pattern
+  isTableActive(tableName: string): Promise<boolean>;
+  isGSIInStatus(
+    tableName: string,
+    indexName: string,
+    targetStatus: "ACTIVE" | "DELETED"
+  ): Promise<boolean>;
 }
 
 const sleep = async (ms: number): Promise<void> =>
@@ -335,5 +343,37 @@ export class DynamoDBGSIServiceImpl implements DynamoDBGSIService {
       await sleep(Math.min(delay, this.waiter.maxDelayMs));
       delay = Math.min(delay * 2, this.waiter.maxDelayMs);
     }
+  }
+
+  /**
+   * テーブルが ACTIVE 状態か確認（待機なし）
+   */
+  async isTableActive(tableName: string): Promise<boolean> {
+    const response = await retryWithBackoff(
+      () =>
+        this.client.send(
+          new DescribeTableCommand({ TableName: tableName })
+        ),
+      this.errorHandling
+    );
+    return response.Table?.TableStatus === "ACTIVE";
+  }
+
+  /**
+   * GSI が指定ステータスに達しているか確認（待機なし）
+   */
+  async isGSIInStatus(
+    tableName: string,
+    indexName: string,
+    targetStatus: "ACTIVE" | "DELETED"
+  ): Promise<boolean> {
+    const indexes = await this.getCurrentGSIs(tableName);
+    const match = indexes.find((gsi) => gsi.indexName === indexName);
+
+    if (targetStatus === "DELETED") {
+      return !match; // GSIが見つからなければ削除完了
+    }
+
+    return match?.indexStatus === targetStatus;
   }
 }

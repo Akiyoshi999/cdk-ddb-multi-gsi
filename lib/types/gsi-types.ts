@@ -157,3 +157,36 @@ export function mergeErrorHandlingConfig(
       [...DEFAULT_ERROR_CONFIG.retryableErrorCodes],
   };
 }
+
+// Async Custom Resource Pattern Types
+
+/**
+ * 非同期カスタムリソースで使用する操作状態
+ */
+export interface GSIOperationState {
+  /** 操作計画（全操作のリスト） */
+  allOperations: GSIOperation[];
+  /** 完了した操作のインデックスリスト */
+  completedIndices: number[];
+  /** 現在実行中の操作のインデックス（-1は未開始） */
+  currentIndex: number;
+  /** 操作開始時刻（ISO 8601形式） */
+  startTime: string;
+}
+
+/**
+ * isCompleteHandler のレスポンス
+ */
+export interface IsCompleteResponse {
+  IsComplete: boolean;
+  Data?: Record<string, unknown>;
+}
+
+/**
+ * onEventHandler のレスポンス（非同期パターン用）
+ */
+export interface OnEventResponse {
+  IsComplete?: boolean;
+  PhysicalResourceId: string;
+  Data?: Record<string, unknown>;
+}

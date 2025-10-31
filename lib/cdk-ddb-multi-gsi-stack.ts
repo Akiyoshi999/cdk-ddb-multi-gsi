@@ -35,6 +35,16 @@ export class CdkDdbMultiGsiStack extends cdk.Stack {
         partitionKey: { name: "GSI4PK", type: "S" },
         sortKey: { name: "GSI4SK", type: "S" },
       },
+      {
+        indexName: "GSI5",
+        partitionKey: { name: "GSI5PK", type: "S" },
+        sortKey: { name: "GSI5SK", type: "S" },
+      },
+      {
+        indexName: "GSI6",
+        partitionKey: { name: "GSI6PK", type: "S" },
+        sortKey: { name: "GSI6SK", type: "S" },
+      },
     ];
 
     new GsiManager(this, "GsiManager", {
