@@ -9,6 +9,7 @@ import {
   mergeErrorHandlingConfig,
   ErrorHandlingConfig,
   OnEventResponse,
+  GSIInfo,
 } from "../../../lib/types/index.js";
 import { DynamoDBGSIServiceImpl } from "./dynamodb-gsi-service.js";
 import { planGsiOperations } from "./operation-planner.js";
@@ -56,6 +57,55 @@ interface HandlerResponse {
 }
 
 const client = new DynamoDBClient({});
+
+const collectManagedNames = (
+  desired: GSIConfiguration[],
+  prior?: GSIConfiguration[]
+): Set<string> => {
+  const names = new Set<string>();
+  desired.forEach((gsi) => names.add(gsi.indexName));
+  prior?.forEach((gsi) => names.add(gsi.indexName));
+  return names;
+};
+
+const resolveCurrentForPlanning = (
+  requestType: CloudFormationRequestType,
+  current: GSIInfo[],
+  managedNames: Set<string>
+): {
+  candidates: GSIInfo[];
+  adoptedLegacyIndexes: boolean;
+  untrackedCount: number;
+} => {
+  if (managedNames.size === 0) {
+    return {
+      candidates: current,
+      adoptedLegacyIndexes: requestType !== "Create" && current.length > 0,
+      untrackedCount: current.length,
+    };
+  }
+
+  const tracked: GSIInfo[] = [];
+  const untracked: GSIInfo[] = [];
+
+  for (const gsi of current) {
+    if (managedNames.has(gsi.indexName)) {
+      tracked.push(gsi);
+    } else {
+      untracked.push(gsi);
+    }
+  }
+
+  const shouldAdopt =
+    (requestType === "Update" || requestType === "Delete") &&
+    untracked.length > 0;
+
+  return {
+    candidates: shouldAdopt ? current : tracked,
+    adoptedLegacyIndexes: shouldAdopt,
+    untrackedCount: untracked.length,
+  };
+};
 
 const toArrayOfStrings = (value: unknown): string[] | undefined => {
   if (!Array.isArray(value)) {
@@ -287,12 +337,30 @@ const handleCreateOrUpdate = async (
     errorHandling,
   });
 
-  const managedNames = new Set(
-    props.globalSecondaryIndexes.map((gsi) => gsi.indexName)
+  // For Update events, we need to track both current and previous managed GSIs
+  // to properly detect and delete removed GSIs
+  const oldProps =
+    event.RequestType === "Update" && event.OldResourceProperties
+      ? parseProperties(event.OldResourceProperties)
+      : undefined;
+  const managedNames = collectManagedNames(
+    props.globalSecondaryIndexes,
+    oldProps?.globalSecondaryIndexes
   );
+
   const current = await service.getCurrentGSIs(props.tableName);
+  const {
+    candidates: managedCurrent,
+    adoptedLegacyIndexes,
+    untrackedCount,
+  } = resolveCurrentForPlanning(event.RequestType, current, managedNames);
+  if (adoptedLegacyIndexes) {
+    console.log(
+      `[GSI Manager] Detected ${untrackedCount} pre-existing GSI(s) not present in configuration; treating them as managed for cleanup.`
+    );
+  }
   const operations = planGsiOperations(
-    current.filter((gsi) => managedNames.has(gsi.indexName)),
+    managedCurrent,
     props.globalSecondaryIndexes
   );
   if (operations.length === 0) {
@@ -323,24 +391,28 @@ const handleDelete = async (
   event: CloudFormationCustomResourceDeleteEvent
 ): Promise<HandlerResponse> => {
   const props = parseProperties(event.ResourceProperties);
-  const managedIndexes = new Set(
-    props.globalSecondaryIndexes.map((gsi) => gsi.indexName)
-  );
-
   const service = new DynamoDBGSIServiceImpl({
     client,
     errorHandling: mergeErrorHandlingConfig(props.errorHandling),
   });
 
   const current = await service.getCurrentGSIs(props.tableName);
-  const targets = current.filter((gsi) => managedIndexes.has(gsi.indexName));
+  const { candidates: targets, adoptedLegacyIndexes, untrackedCount } =
+    resolveCurrentForPlanning(event.RequestType, current, collectManagedNames(props.globalSecondaryIndexes));
+  if (adoptedLegacyIndexes) {
+    console.log(
+      `[GSI Manager] Detected ${untrackedCount} unmanaged GSI(s) during Delete; including them in cleanup.`
+    );
+  }
 
   if (targets.length === 0) {
     return {
       PhysicalResourceId: ensurePhysicalId(event),
       Data: {
         operationsExecuted: 0,
-        managedIndexes: Array.from(managedIndexes).join(","),
+        managedIndexes: props.globalSecondaryIndexes
+          .map((gsi) => gsi.indexName)
+          .join(","),
       },
     };
   }
@@ -359,7 +431,9 @@ const handleDelete = async (
     PhysicalResourceId: ensurePhysicalId(event),
     Data: {
       operationsExecuted: results.length,
-      managedIndexes: Array.from(managedIndexes).join(","),
+      managedIndexes: props.globalSecondaryIndexes
+        .map((gsi) => gsi.indexName)
+        .join(","),
     },
   };
 };
@@ -425,10 +499,28 @@ const handleCreateOrUpdateAsync = async (
   const errorHandling = mergeErrorHandlingConfig(props.errorHandling);
   const service = new DynamoDBGSIServiceImpl({ client, errorHandling });
 
-  const managedNames = new Set(props.globalSecondaryIndexes.map((gsi) => gsi.indexName));
+  const oldProps =
+    event.RequestType === "Update" && event.OldResourceProperties
+      ? parseProperties(event.OldResourceProperties)
+      : undefined;
+  const managedNames = collectManagedNames(
+    props.globalSecondaryIndexes,
+    oldProps?.globalSecondaryIndexes
+  );
+
   const current = await service.getCurrentGSIs(props.tableName);
+  const {
+    candidates: managedCurrent,
+    adoptedLegacyIndexes,
+    untrackedCount,
+  } = resolveCurrentForPlanning(event.RequestType, current, managedNames);
+  if (adoptedLegacyIndexes) {
+    console.log(
+      `[GSI Manager] Detected ${untrackedCount} pre-existing GSI(s) not present in configuration; treating them as managed for cleanup.`
+    );
+  }
   const operations = planGsiOperations(
-    current.filter((gsi) => managedNames.has(gsi.indexName)),
+    managedCurrent,
     props.globalSecondaryIndexes
   );
 
@@ -464,17 +556,19 @@ const handleDeleteAsync = async (
   event: CloudFormationCustomResourceDeleteEvent
 ): Promise<OnEventResponse> => {
   const props = parseProperties(event.ResourceProperties);
-  const managedIndexes = new Set(
-    props.globalSecondaryIndexes.map((gsi) => gsi.indexName)
-  );
-
   const service = new DynamoDBGSIServiceImpl({
     client,
     errorHandling: mergeErrorHandlingConfig(props.errorHandling),
   });
 
   const current = await service.getCurrentGSIs(props.tableName);
-  const targets = current.filter((gsi) => managedIndexes.has(gsi.indexName));
+  const { candidates: targets, adoptedLegacyIndexes, untrackedCount } =
+    resolveCurrentForPlanning(event.RequestType, current, collectManagedNames(props.globalSecondaryIndexes));
+  if (adoptedLegacyIndexes) {
+    console.log(
+      `[GSI Manager] Detected ${untrackedCount} unmanaged GSI(s) during Delete; including them in cleanup.`
+    );
+  }
 
   if (targets.length === 0) {
     return {
@@ -482,7 +576,9 @@ const handleDeleteAsync = async (
       PhysicalResourceId: ensurePhysicalId(event),
       Data: {
         operationsExecuted: 0,
-        managedIndexes: Array.from(managedIndexes).join(","),
+        managedIndexes: props.globalSecondaryIndexes
+          .map((gsi) => gsi.indexName)
+          .join(","),
       },
     };
   }
