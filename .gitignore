@@ -9,4 +9,5 @@ node_modules
 cdk.out
 
 .env
-explain-code.md
+.mcp.json
+docs/blog.md

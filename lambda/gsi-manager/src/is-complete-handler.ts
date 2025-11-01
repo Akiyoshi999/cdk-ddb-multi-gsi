@@ -5,6 +5,7 @@ import type {
   GSIConfiguration,
   GSIManagerProps,
   ErrorHandlingConfig,
+  GSIInfo,
 } from "../../../lib/types/index.js";
 import { mergeErrorHandlingConfig } from "../../../lib/types/index.js";
 import { DynamoDBGSIServiceImpl } from "./dynamodb-gsi-service.js";
@@ -16,6 +17,7 @@ interface IsCompleteEvent {
   RequestType: "Create" | "Update" | "Delete";
   PhysicalResourceId: string;
   ResourceProperties: Record<string, unknown>;
+  OldResourceProperties?: Record<string, unknown>;
 }
 
 // ResourceProperties のパース（handler.ts と同じロジック）
@@ -204,12 +206,30 @@ export const isCompleteHandler = async (
   console.log(`[GSI Manager][isComplete] Checking operations for table ${props.tableName}`);
 
   // 現在の GSI 状態を取得
-  const managedNames = new Set(props.globalSecondaryIndexes.map((gsi) => gsi.indexName));
+  const oldProps =
+    event.RequestType === "Update" && event.OldResourceProperties
+      ? parseProperties(event.OldResourceProperties)
+      : undefined;
+  const managedNames = collectManagedNames(
+    props.globalSecondaryIndexes,
+    oldProps?.globalSecondaryIndexes
+  );
+
   const current = await service.getCurrentGSIs(props.tableName);
+  const {
+    candidates: managedCurrent,
+    adoptedLegacyIndexes,
+    untrackedCount,
+  } = resolveCurrentForPlanning(event.RequestType, current, managedNames);
+  if (adoptedLegacyIndexes) {
+    console.log(
+      `[GSI Manager][isComplete] Detected ${untrackedCount} pre-existing GSI(s) not present in configuration; adopting them for cleanup.`
+    );
+  }
 
   // Delete の場合は、管理対象のGSIを1つずつ削除
   if (event.RequestType === "Delete") {
-    const existingManaged = current.filter((gsi) => managedNames.has(gsi.indexName));
+    const existingManaged = managedCurrent;
 
     if (existingManaged.length === 0) {
       // すべて削除済み
@@ -218,7 +238,7 @@ export const isCompleteHandler = async (
         IsComplete: true,
         Data: {
           operationsExecuted: props.globalSecondaryIndexes.length,
-          managedIndexes: Array.from(managedNames).join(","),
+          managedIndexes: props.globalSecondaryIndexes.map((gsi) => gsi.indexName).join(","),
         },
       };
     }
@@ -246,7 +266,7 @@ export const isCompleteHandler = async (
         IsComplete: true,
         Data: {
           operationsExecuted: props.globalSecondaryIndexes.length,
-          managedIndexes: Array.from(managedNames).join(","),
+          managedIndexes: props.globalSecondaryIndexes.map((gsi) => gsi.indexName).join(","),
         },
       };
     }
@@ -272,11 +292,11 @@ export const isCompleteHandler = async (
 
   // Create/Update の場合:
   // まず、進行中の操作があるかチェック（DynamoDB制限対応）
-  const inProgressGSI = current.find((gsi) =>
-    managedNames.has(gsi.indexName) &&
-    (gsi.indexStatus === "CREATING" ||
-     gsi.indexStatus === "UPDATING" ||
-     gsi.indexStatus === "DELETING")
+  const inProgressGSI = managedCurrent.find(
+    (gsi) =>
+      gsi.indexStatus === "CREATING" ||
+      gsi.indexStatus === "UPDATING" ||
+      gsi.indexStatus === "DELETING"
   );
 
   if (inProgressGSI) {
@@ -308,10 +328,7 @@ export const isCompleteHandler = async (
   }
 
   // 進行中の操作がない → 操作計画を再計算
-  const operations = planGsiOperations(
-    current.filter((gsi) => managedNames.has(gsi.indexName)),
-    props.globalSecondaryIndexes
-  );
+  const operations = planGsiOperations(managedCurrent, props.globalSecondaryIndexes);
 
   if (operations.length === 0) {
     // すべての操作が完了している
@@ -320,7 +337,7 @@ export const isCompleteHandler = async (
       IsComplete: true,
       Data: {
         operationsExecuted: props.globalSecondaryIndexes.length,
-        managedIndexes: Array.from(managedNames).join(","),
+        managedIndexes: props.globalSecondaryIndexes.map((gsi) => gsi.indexName).join(","),
       },
     };
   }
@@ -350,7 +367,7 @@ export const isCompleteHandler = async (
       IsComplete: true,
       Data: {
         operationsExecuted: props.globalSecondaryIndexes.length,
-        managedIndexes: Array.from(managedNames).join(","),
+        managedIndexes: props.globalSecondaryIndexes.map((gsi) => gsi.indexName).join(","),
       },
     };
   }
@@ -398,4 +415,52 @@ export const isCompleteHandler = async (
 
   // 想定外の操作タイプ
   throw new Error(`Unknown operation type: ${operation.type}`);
+};
+const collectManagedNames = (
+  desired: GSIConfiguration[],
+  prior?: GSIConfiguration[]
+): Set<string> => {
+  const names = new Set<string>();
+  desired.forEach((gsi) => names.add(gsi.indexName));
+  prior?.forEach((gsi) => names.add(gsi.indexName));
+  return names;
+};
+
+const resolveCurrentForPlanning = (
+  requestType: IsCompleteEvent["RequestType"],
+  current: GSIInfo[],
+  managedNames: Set<string>
+): {
+  candidates: GSIInfo[];
+  adoptedLegacyIndexes: boolean;
+  untrackedCount: number;
+} => {
+  if (managedNames.size === 0) {
+    return {
+      candidates: current,
+      adoptedLegacyIndexes: requestType !== "Create" && current.length > 0,
+      untrackedCount: current.length,
+    };
+  }
+
+  const tracked: GSIInfo[] = [];
+  const untracked: GSIInfo[] = [];
+
+  for (const gsi of current) {
+    if (managedNames.has(gsi.indexName)) {
+      tracked.push(gsi);
+    } else {
+      untracked.push(gsi);
+    }
+  }
+
+  const shouldAdopt =
+    (requestType === "Update" || requestType === "Delete") &&
+    untracked.length > 0;
+
+  return {
+    candidates: shouldAdopt ? current : tracked,
+    adoptedLegacyIndexes: shouldAdopt,
+    untrackedCount: untracked.length,
+  };
 };
