@@ -42,6 +42,8 @@ export interface DynamoDBGSIServiceOptions {
   waiter?: Partial<WaiterConfig>;
 }
 
+type TableBillingMode = "PROVISIONED" | "PAY_PER_REQUEST";
+
 export interface DynamoDBGSIService {
   getCurrentGSIs(tableName: string): Promise<GSIInfo[]>;
   createGSI(tableName: string, gsiConfig: GSIConfiguration): Promise<void>;
@@ -127,6 +129,7 @@ export class DynamoDBGSIServiceImpl implements DynamoDBGSIService {
   private readonly client: DynamoDBClient;
   private readonly errorHandling: ErrorHandlingConfig;
   private readonly waiter: WaiterConfig;
+  private readonly tableBillingModeCache = new Map<string, TableBillingMode>();
 
   constructor(options: DynamoDBGSIServiceOptions = {}) {
     this.client = options.client ?? new DynamoDBClient({});
@@ -168,17 +171,18 @@ export class DynamoDBGSIServiceImpl implements DynamoDBGSIService {
             (gsi.Projection?.ProjectionType as "ALL" | "KEYS_ONLY" | "INCLUDE") ??
             "ALL",
           nonKeyAttributes: gsi.Projection?.NonKeyAttributes ?? undefined,
-      },
-      indexStatus: gsi.IndexStatus ?? undefined,
-      provisionedThroughput: gsi.ProvisionedThroughput
-        ? {
-            readCapacityUnits:
-              gsi.ProvisionedThroughput.ReadCapacityUnits ?? 0,
-            writeCapacityUnits:
-              gsi.ProvisionedThroughput.WriteCapacityUnits ?? 0,
-          }
-        : undefined,
-    }));
+        },
+        indexStatus: gsi.IndexStatus ?? undefined,
+        provisionedThroughput: gsi.ProvisionedThroughput
+          ? {
+              readCapacityUnits:
+                gsi.ProvisionedThroughput.ReadCapacityUnits ?? 0,
+              writeCapacityUnits:
+                gsi.ProvisionedThroughput.WriteCapacityUnits ?? 0,
+            }
+          : undefined,
+      })
+    );
   }
 
   async createGSI(
@@ -189,7 +193,14 @@ export class DynamoDBGSIServiceImpl implements DynamoDBGSIService {
     const KeySchema = toKeySchema(gsiConfig);
 
     const Projection = toProjection(gsiConfig);
-    const ProvisionedThroughput = toProvisionedThroughput(gsiConfig);
+    let ProvisionedThroughput = toProvisionedThroughput(gsiConfig);
+
+    if (ProvisionedThroughput && (await this.isPayPerRequestTable(tableName))) {
+      console.log(
+        `[GSI Manager] Table "${tableName}" uses PAY_PER_REQUEST; ignoring provisioned throughput for index "${gsiConfig.indexName}".`
+      );
+      ProvisionedThroughput = undefined;
+    }
 
     const update: GlobalSecondaryIndexUpdate = {
       Create: {
@@ -218,6 +229,13 @@ export class DynamoDBGSIServiceImpl implements DynamoDBGSIService {
     gsiConfig: GSIConfiguration
   ): Promise<void> {
     if (!gsiConfig.provisionedThroughput) {
+      return;
+    }
+
+    if (await this.isPayPerRequestTable(tableName)) {
+      console.log(
+        `[GSI Manager] Table "${tableName}" uses PAY_PER_REQUEST; skipping throughput update for index "${gsiConfig.indexName}".`
+      );
       return;
     }
 
@@ -375,5 +393,35 @@ export class DynamoDBGSIServiceImpl implements DynamoDBGSIService {
     }
 
     return match?.indexStatus === targetStatus;
+  }
+
+  private async isPayPerRequestTable(tableName: string): Promise<boolean> {
+    const cached = this.tableBillingModeCache.get(tableName);
+    if (cached) {
+      return cached === "PAY_PER_REQUEST";
+    }
+
+    const billingMode = await this.fetchTableBillingMode(tableName);
+    this.tableBillingModeCache.set(tableName, billingMode);
+    return billingMode === "PAY_PER_REQUEST";
+  }
+
+  private async fetchTableBillingMode(
+    tableName: string
+  ): Promise<TableBillingMode> {
+    const response = await retryWithBackoff<DescribeTableCommandOutput>(
+      () =>
+        this.client.send<DescribeTableCommandOutput>(
+          new DescribeTableCommand({ TableName: tableName })
+        ),
+      this.errorHandling
+    );
+
+    const mode =
+      response.Table?.BillingModeSummary?.BillingMode === "PAY_PER_REQUEST"
+        ? "PAY_PER_REQUEST"
+        : "PROVISIONED";
+
+    return mode;
   }
 }

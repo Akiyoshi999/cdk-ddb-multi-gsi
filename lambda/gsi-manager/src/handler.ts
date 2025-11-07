@@ -1,8 +1,14 @@
-// CloudFormation custom resource handler that orchestrates DynamoDB GSI changes.
+/**
+ * CloudFormation カスタムリソースハンドラー
+ * DynamoDB の Global Secondary Index (GSI) の作成・更新・削除を管理します
+ *
+ * このハンドラーは以下の2つのパターンをサポートします：
+ * 1. 同期パターン (handler): 完了まで待機してから応答を返す
+ * 2. 非同期パターン (onEventHandler): 操作を開始して即座に返却し、isCompleteHandlerでポーリング
+ */
+
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
-  GSIConfiguration,
-  GSIManagerProps,
   GSIOperation,
   GSIOperationResult,
   validateGsiConfigurations,
@@ -12,215 +18,106 @@ import {
   GSIInfo,
 } from "../../../lib/types/index.js";
 import { DynamoDBGSIServiceImpl } from "./dynamodb-gsi-service.js";
+import {
+  collectManagedNames,
+  parseManagerProps,
+  resolveCurrentForPlanning,
+} from "./gsi-config-utils.js";
 import { planGsiOperations } from "./operation-planner.js";
 
+/** CloudFormation カスタムリソースのリクエストタイプ */
 type CloudFormationRequestType = "Create" | "Update" | "Delete";
 
+/**
+ * CloudFormation カスタムリソースイベントの共通プロパティ
+ * すべてのリクエストタイプ（Create, Update, Delete）に共通するフィールドを定義
+ */
 interface CloudFormationCustomResourceEventCommon {
+  /** リクエストの種類（Create, Update, Delete） */
   RequestType: CloudFormationRequestType;
+  /** Lambda関数を呼び出すためのARN */
   ServiceToken: string;
+  /** CloudFormationがレスポンスを受け取るための署名付きURL */
   ResponseURL: string;
+  /** スタックの一意識別子 */
   StackId: string;
+  /** このリクエストの一意識別子 */
   RequestId: string;
+  /** CloudFormationテンプレート内のリソースの論理ID */
   LogicalResourceId: string;
+  /** リソースの物理ID（省略可能） */
   PhysicalResourceId?: string;
+  /** カスタムリソースのタイプ名（省略可能） */
   ResourceType?: string;
+  /** リソースのプロパティ */
   ResourceProperties: Record<string, unknown>;
+  /** 以前のリソースプロパティ（Update時のみ） */
   OldResourceProperties?: Record<string, unknown>;
 }
 
+/**
+ * CloudFormation カスタムリソースの Create イベント
+ * リソースが初めて作成されるときに発火
+ */
 export interface CloudFormationCustomResourceCreateEvent
   extends CloudFormationCustomResourceEventCommon {
   RequestType: "Create";
 }
 
+/**
+ * CloudFormation カスタムリソースの Update イベント
+ * リソースのプロパティが変更されたときに発火
+ */
 export interface CloudFormationCustomResourceUpdateEvent
   extends CloudFormationCustomResourceEventCommon {
   RequestType: "Update";
+  /** 既存リソースの物理ID（必須） */
   PhysicalResourceId: string;
 }
 
+/**
+ * CloudFormation カスタムリソースの Delete イベント
+ * リソースが削除されるときに発火
+ */
 export interface CloudFormationCustomResourceDeleteEvent
   extends CloudFormationCustomResourceEventCommon {
   RequestType: "Delete";
+  /** 削除対象リソースの物理ID（必須） */
   PhysicalResourceId: string;
 }
 
+/**
+ * CloudFormation カスタムリソースイベントの統合型
+ * Create, Update, Delete のいずれかのイベント
+ */
 type CloudFormationCustomResourceEvent =
   | CloudFormationCustomResourceCreateEvent
   | CloudFormationCustomResourceUpdateEvent
   | CloudFormationCustomResourceDeleteEvent;
 
+/**
+ * ハンドラーのレスポンス型
+ * CloudFormation に返却するデータ構造
+ */
 interface HandlerResponse {
+  /** リソースの物理ID */
   PhysicalResourceId: string;
+  /** CloudFormation スタックの出力に含める追加データ */
   Data?: Record<string, unknown>;
 }
 
+/** DynamoDB クライアントのシングルトンインスタンス */
 const client = new DynamoDBClient({});
 
-const collectManagedNames = (
-  desired: GSIConfiguration[],
-  prior?: GSIConfiguration[]
-): Set<string> => {
-  const names = new Set<string>();
-  desired.forEach((gsi) => names.add(gsi.indexName));
-  prior?.forEach((gsi) => names.add(gsi.indexName));
-  return names;
-};
-
-const resolveCurrentForPlanning = (
-  requestType: CloudFormationRequestType,
-  current: GSIInfo[],
-  managedNames: Set<string>
-): {
-  candidates: GSIInfo[];
-  adoptedLegacyIndexes: boolean;
-  untrackedCount: number;
-} => {
-  if (managedNames.size === 0) {
-    return {
-      candidates: current,
-      adoptedLegacyIndexes: requestType !== "Create" && current.length > 0,
-      untrackedCount: current.length,
-    };
-  }
-
-  const tracked: GSIInfo[] = [];
-  const untracked: GSIInfo[] = [];
-
-  for (const gsi of current) {
-    if (managedNames.has(gsi.indexName)) {
-      tracked.push(gsi);
-    } else {
-      untracked.push(gsi);
-    }
-  }
-
-  const shouldAdopt =
-    (requestType === "Update" || requestType === "Delete") &&
-    untracked.length > 0;
-
-  return {
-    candidates: shouldAdopt ? current : tracked,
-    adoptedLegacyIndexes: shouldAdopt,
-    untrackedCount: untracked.length,
-  };
-};
-
-const toArrayOfStrings = (value: unknown): string[] | undefined => {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-
-  const values = value
-    .map((entry) => (typeof entry === "string" ? entry : undefined))
-    .filter((entry): entry is string => Boolean(entry));
-
-  return values.length > 0 ? values : undefined;
-};
-
-const parseAttribute = (
-  value: unknown,
-  fallbackType: "S" | "N" | "B" = "S"
-) => {
-  if (!value || typeof value !== "object") {
-    return { name: "", type: fallbackType };
-  }
-
-  const record = value as { name?: unknown; type?: unknown };
-  return {
-    name: typeof record.name === "string" ? record.name : "",
-    type:
-      record.type === "S" || record.type === "N" || record.type === "B"
-        ? record.type
-        : fallbackType,
-  };
-};
-
-const parseProvisionedThroughput = (value: unknown) => {
-  if (!value || typeof value !== "object") {
-    return undefined;
-  }
-
-  const record = value as {
-    readCapacityUnits?: unknown;
-    writeCapacityUnits?: unknown;
-  };
-
-  const readCapacityUnits =
-    typeof record.readCapacityUnits === "number"
-      ? record.readCapacityUnits
-      : record.readCapacityUnits
-        ? Number(record.readCapacityUnits)
-        : undefined;
-
-  const writeCapacityUnits =
-    typeof record.writeCapacityUnits === "number"
-      ? record.writeCapacityUnits
-      : record.writeCapacityUnits
-        ? Number(record.writeCapacityUnits)
-        : undefined;
-
-  if (readCapacityUnits === undefined || writeCapacityUnits === undefined) {
-    return undefined;
-  }
-
-  return {
-    readCapacityUnits,
-    writeCapacityUnits,
-  };
-};
-
-const parseGsiConfigs = (value: unknown): GSIConfiguration[] => {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.map((entry) => {
-    const record =
-      entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
-
-    const projectionType =
-      record.projectionType === "ALL" ||
-      record.projectionType === "KEYS_ONLY" ||
-      record.projectionType === "INCLUDE"
-        ? record.projectionType
-        : undefined;
-
-    return {
-      indexName: typeof record.indexName === "string" ? record.indexName : "",
-      partitionKey: parseAttribute(record.partitionKey, "S"),
-      sortKey: record.sortKey ? parseAttribute(record.sortKey, "S") : undefined,
-      projectionType,
-      nonKeyAttributes: toArrayOfStrings(record.nonKeyAttributes),
-      provisionedThroughput: parseProvisionedThroughput(
-        record.provisionedThroughput
-      ),
-    };
-  });
-};
-
-const parseProperties = (
-  props: Record<string, unknown>
-): GSIManagerProps => {
-  // CloudFormation sometimes re-cases property names, so we check both variants.
-  const tableNameSource =
-    typeof props.tableName === "string"
-      ? props.tableName
-      : props.TableName;
-
-  return {
-    tableName: typeof tableNameSource === "string" ? tableNameSource : "",
-    globalSecondaryIndexes: parseGsiConfigs(
-      props.globalSecondaryIndexes ?? props.GlobalSecondaryIndexes
-    ),
-    errorHandling:
-      props.errorHandling && typeof props.errorHandling === "object"
-        ? (props.errorHandling as Partial<ErrorHandlingConfig>)
-        : undefined,
-  };
-};
-
+/**
+ * 物理リソースIDを取得または生成
+ *
+ * CloudFormation はリソースを一意に識別するために物理IDを必要とします。
+ * 既存の ID がある場合はそれを使用し、ない場合は新規生成します。
+ *
+ * @param event - CloudFormation カスタムリソースイベント
+ * @returns リソースの物理ID
+ */
 const ensurePhysicalId = (
   event: CloudFormationCustomResourceEvent
 ): string =>
@@ -228,6 +125,17 @@ const ensurePhysicalId = (
     ? event.PhysicalResourceId
     : `GSIManager-${event.ResourceProperties["tableName"] ?? "UnknownTable"}`;
 
+/**
+ * GSI 操作を順次実行
+ *
+ * DynamoDB の制限により、GSI 操作は1つずつ順番に実行する必要があります。
+ * 各操作の完了を待機してから次の操作を開始します。
+ *
+ * @param tableName - 対象テーブル名
+ * @param operations - 実行する GSI 操作のリスト
+ * @param service - DynamoDB GSI サービスインスタンス
+ * @returns 各操作の実行結果
+ */
 const executeOperations = async (
   tableName: string,
   operations: GSIOperation[],
@@ -246,10 +154,11 @@ const executeOperations = async (
     `[GSI Manager] Starting ${total} GSI operation(s) (table=${tableName}).`
   );
 
-  // CloudFormation may re-invoke the handler quickly; ensure the table is stable first.
+  // CloudFormation が再実行する可能性があるため、最初にテーブルが安定していることを確認
   await service.waitForTableActive(tableName);
   const results: GSIOperationResult[] = [];
 
+  // 各操作を順次実行（DynamoDB は同時に1つの GSI 操作のみサポート）
   for (const [index, operation] of operations.entries()) {
     const displayIndex = index + 1;
     const before = Date.now();
@@ -322,10 +231,20 @@ const executeOperations = async (
   return results;
 };
 
+/**
+ * Create または Update イベントを処理（同期パターン）
+ *
+ * GSI 構成を検証し、現在の状態と比較して必要な操作を計画・実行します。
+ * Update の場合は、削除された GSI も検出して削除します。
+ *
+ * @param event - CloudFormation の Create または Update イベント
+ * @returns ハンドラーレスポンス（物理ID と実行結果データ）
+ * @throws GSI 構成が無効な場合にエラーをスロー
+ */
 const handleCreateOrUpdate = async (
   event: CloudFormationCustomResourceCreateEvent | CloudFormationCustomResourceUpdateEvent
 ): Promise<HandlerResponse> => {
-  const props = parseProperties(event.ResourceProperties);
+  const props = parseManagerProps(event.ResourceProperties);
   const errors = validateGsiConfigurations(props.globalSecondaryIndexes);
   if (errors.length > 0) {
     throw new Error(["Invalid GSI configuration detected:", ...errors].join("\n- "));
@@ -337,11 +256,11 @@ const handleCreateOrUpdate = async (
     errorHandling,
   });
 
-  // For Update events, we need to track both current and previous managed GSIs
-  // to properly detect and delete removed GSIs
+  // Update イベントの場合、削除された GSI を検出するために
+  // 現在と以前の管理対象 GSI の両方を追跡する必要がある
   const oldProps =
     event.RequestType === "Update" && event.OldResourceProperties
-      ? parseProperties(event.OldResourceProperties)
+      ? parseManagerProps(event.OldResourceProperties)
       : undefined;
   const managedNames = collectManagedNames(
     props.globalSecondaryIndexes,
@@ -387,10 +306,19 @@ const handleCreateOrUpdate = async (
   };
 };
 
+/**
+ * Delete イベントを処理（同期パターン）
+ *
+ * 管理対象のすべての GSI を削除します。
+ * 管理されていない GSI も検出した場合は、クリーンアップのために削除します。
+ *
+ * @param event - CloudFormation の Delete イベント
+ * @returns ハンドラーレスポンス（物理ID と削除結果データ）
+ */
 const handleDelete = async (
   event: CloudFormationCustomResourceDeleteEvent
 ): Promise<HandlerResponse> => {
-  const props = parseProperties(event.ResourceProperties);
+  const props = parseManagerProps(event.ResourceProperties);
   const service = new DynamoDBGSIServiceImpl({
     client,
     errorHandling: mergeErrorHandlingConfig(props.errorHandling),
@@ -438,6 +366,16 @@ const handleDelete = async (
   };
 };
 
+/**
+ * CloudFormation カスタムリソースのメインハンドラー（同期パターン）
+ *
+ * すべての GSI 操作が完了するまで待機してから応答を返します。
+ * Lambda のタイムアウト制限（最大15分）に注意が必要です。
+ *
+ * @param event - CloudFormation カスタムリソースイベント
+ * @returns ハンドラーレスポンス
+ * @throws サポートされていないリクエストタイプの場合にエラーをスロー
+ */
 export const handler = async (
   event: CloudFormationCustomResourceEvent
 ): Promise<HandlerResponse> => {
@@ -453,17 +391,25 @@ export const handler = async (
   }
 };
 
-// ===== Async Custom Resource Pattern Functions =====
+// ===== 非同期カスタムリソースパターン用の関数 =====
 
 /**
- * 操作を開始（待機なし）
+ * GSI 操作を開始（完了を待機しない）
+ *
+ * テーブルが ACTIVE 状態になるまで待機してから操作を開始しますが、
+ * GSI のステータス変更完了は待ちません。
+ *
+ * @param tableName - 対象テーブル名
+ * @param operation - 実行する GSI 操作
+ * @param service - DynamoDB GSI サービスインスタンス
+ * @throws 必須の構成が欠けている場合にエラーをスロー
  */
 const startOperation = async (
   tableName: string,
   operation: GSIOperation,
   service: DynamoDBGSIServiceImpl
 ): Promise<void> => {
-  // テーブルがACTIVEになるまで待機（これは必須）
+  // テーブルが ACTIVE になるまで待機（必須前提条件）
   await service.waitForTableActive(tableName);
 
   switch (operation.type) {
@@ -484,13 +430,23 @@ const startOperation = async (
       break;
   }
 
-  // 操作を開始したら即座に返す（GSIのステータス待機はしない）
+  // 操作を開始したら即座に返す（GSI のステータス変更完了は待機しない）
 };
 
+/**
+ * Create または Update イベントを処理（非同期パターン）
+ *
+ * 最初の GSI 操作のみを開始し、完了を待たずに即座に IsComplete=false を返します。
+ * isCompleteHandler が操作の完了を確認し、次の操作を開始します。
+ *
+ * @param event - CloudFormation の Create または Update イベント
+ * @returns 非同期レスポンス（IsComplete フラグと物理ID）
+ * @throws GSI 構成が無効な場合にエラーをスロー
+ */
 const handleCreateOrUpdateAsync = async (
   event: CloudFormationCustomResourceCreateEvent | CloudFormationCustomResourceUpdateEvent
 ): Promise<OnEventResponse> => {
-  const props = parseProperties(event.ResourceProperties);
+  const props = parseManagerProps(event.ResourceProperties);
   const errors = validateGsiConfigurations(props.globalSecondaryIndexes);
   if (errors.length > 0) {
     throw new Error(["Invalid GSI configuration detected:", ...errors].join("\n- "));
@@ -501,7 +457,7 @@ const handleCreateOrUpdateAsync = async (
 
   const oldProps =
     event.RequestType === "Update" && event.OldResourceProperties
-      ? parseProperties(event.OldResourceProperties)
+      ? parseManagerProps(event.OldResourceProperties)
       : undefined;
   const managedNames = collectManagedNames(
     props.globalSecondaryIndexes,
@@ -525,7 +481,7 @@ const handleCreateOrUpdateAsync = async (
   );
 
   if (operations.length === 0) {
-    // 操作が不要な場合は即座に完了
+    // 操作が不要な場合は即座に完了を通知
     return {
       IsComplete: true,
       PhysicalResourceId: ensurePhysicalId(event),
@@ -536,7 +492,7 @@ const handleCreateOrUpdateAsync = async (
     };
   }
 
-  // 最初の操作を開始（待機しない）
+  // 最初の操作のみを開始（完了を待機しない）
   const firstOperation = operations[0];
   await startOperation(props.tableName, firstOperation, service);
 
@@ -545,17 +501,26 @@ const handleCreateOrUpdateAsync = async (
     `Total operations: ${operations.length}`
   );
 
-  // IsComplete=false の場合は Data を返さない（CloudFormation Provider の制約）
+  // IsComplete=false の場合は Data を返さない（CloudFormation Provider Framework の制約）
   return {
     IsComplete: false,
     PhysicalResourceId: ensurePhysicalId(event),
   };
 };
 
+/**
+ * Delete イベントを処理（非同期パターン）
+ *
+ * 最初の GSI 削除操作のみを開始し、完了を待たずに即座に IsComplete=false を返します。
+ * isCompleteHandler が削除の完了を確認し、次の削除操作を開始します。
+ *
+ * @param event - CloudFormation の Delete イベント
+ * @returns 非同期レスポンス（IsComplete フラグと物理ID）
+ */
 const handleDeleteAsync = async (
   event: CloudFormationCustomResourceDeleteEvent
 ): Promise<OnEventResponse> => {
-  const props = parseProperties(event.ResourceProperties);
+  const props = parseManagerProps(event.ResourceProperties);
   const service = new DynamoDBGSIServiceImpl({
     client,
     errorHandling: mergeErrorHandlingConfig(props.errorHandling),
@@ -589,7 +554,7 @@ const handleDeleteAsync = async (
     currentConfiguration: gsi,
   }));
 
-  // 最初の操作を開始（待機しない）
+  // 最初の削除操作のみを開始（完了を待機しない）
   const firstOperation = operations[0];
   await startOperation(props.tableName, firstOperation, service);
 
@@ -598,7 +563,7 @@ const handleDeleteAsync = async (
     `Total operations: ${operations.length}`
   );
 
-  // IsComplete=false の場合は Data を返さない（CloudFormation Provider の制約）
+  // IsComplete=false の場合は Data を返さない（CloudFormation Provider Framework の制約）
   return {
     IsComplete: false,
     PhysicalResourceId: ensurePhysicalId(event),
@@ -606,8 +571,18 @@ const handleDeleteAsync = async (
 };
 
 /**
- * CloudFormation カスタムリソースの onEvent ハンドラー
- * 操作を開始するが、完了を待たずに即座に返却
+ * CloudFormation カスタムリソースの onEvent ハンドラー（非同期パターン）
+ *
+ * 操作を開始するが、完了を待たずに即座に返却します。
+ * CloudFormation Provider Framework が定期的に isCompleteHandler を呼び出して
+ * 操作の完了を確認します。
+ *
+ * このパターンは Lambda のタイムアウト制限（15分）を回避し、
+ * 長時間実行される GSI 操作を安全に処理できます。
+ *
+ * @param event - CloudFormation カスタムリソースイベント
+ * @returns 非同期レスポンス（IsComplete フラグと物理ID）
+ * @throws サポートされていないリクエストタイプの場合にエラーをスロー
  */
 export const onEventHandler = async (
   event: CloudFormationCustomResourceEvent

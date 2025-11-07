@@ -1,149 +1,64 @@
+/**
+ * CloudFormation カスタムリソースの isComplete ハンドラー（非同期パターン用）
+ *
+ * onEventHandler で開始された GSI 操作の完了状態を確認し、
+ * 必要に応じて次の操作を開始します。
+ *
+ * CloudFormation Provider Framework により定期的に呼び出され、
+ * IsComplete=true を返すまで繰り返し実行されます。
+ */
+
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import type {
   IsCompleteResponse,
   GSIOperation,
-  GSIConfiguration,
-  GSIManagerProps,
   ErrorHandlingConfig,
   GSIInfo,
 } from "../../../lib/types/index.js";
 import { mergeErrorHandlingConfig } from "../../../lib/types/index.js";
 import { DynamoDBGSIServiceImpl } from "./dynamodb-gsi-service.js";
+import {
+  collectManagedNames,
+  parseManagerProps,
+  resolveCurrentForPlanning,
+} from "./gsi-config-utils.js";
 import { planGsiOperations } from "./operation-planner.js";
 
+/** DynamoDB クライアントのシングルトンインスタンス */
 const client = new DynamoDBClient({});
 
+/**
+ * isComplete ハンドラーに渡されるイベント
+ * CloudFormation Provider Framework から定期的に呼び出される
+ */
 interface IsCompleteEvent {
+  /** リクエストの種類（Create, Update, Delete） */
   RequestType: "Create" | "Update" | "Delete";
+  /** リソースの物理ID */
   PhysicalResourceId: string;
+  /** リソースのプロパティ */
   ResourceProperties: Record<string, unknown>;
+  /** 以前のリソースプロパティ（Update時のみ） */
   OldResourceProperties?: Record<string, unknown>;
 }
 
-// ResourceProperties のパース（handler.ts と同じロジック）
-const toArrayOfStrings = (value: unknown): string[] | undefined => {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-
-  const values = value
-    .map((entry) => (typeof entry === "string" ? entry : undefined))
-    .filter((entry): entry is string => Boolean(entry));
-
-  return values.length > 0 ? values : undefined;
-};
-
-const parseAttribute = (
-  value: unknown,
-  fallbackType: "S" | "N" | "B" = "S"
-) => {
-  if (!value || typeof value !== "object") {
-    return { name: "", type: fallbackType };
-  }
-
-  const record = value as { name?: unknown; type?: unknown };
-  return {
-    name: typeof record.name === "string" ? record.name : "",
-    type:
-      record.type === "S" || record.type === "N" || record.type === "B"
-        ? record.type
-        : fallbackType,
-  };
-};
-
-const parseProvisionedThroughput = (value: unknown) => {
-  if (!value || typeof value !== "object") {
-    return undefined;
-  }
-
-  const record = value as {
-    readCapacityUnits?: unknown;
-    writeCapacityUnits?: unknown;
-  };
-
-  const readCapacityUnits =
-    typeof record.readCapacityUnits === "number"
-      ? record.readCapacityUnits
-      : record.readCapacityUnits
-        ? Number(record.readCapacityUnits)
-        : undefined;
-
-  const writeCapacityUnits =
-    typeof record.writeCapacityUnits === "number"
-      ? record.writeCapacityUnits
-      : record.writeCapacityUnits
-        ? Number(record.writeCapacityUnits)
-        : undefined;
-
-  if (readCapacityUnits === undefined || writeCapacityUnits === undefined) {
-    return undefined;
-  }
-
-  return {
-    readCapacityUnits,
-    writeCapacityUnits,
-  };
-};
-
-const parseGsiConfigs = (value: unknown): GSIConfiguration[] => {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.map((entry) => {
-    const record =
-      entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
-
-    const projectionType =
-      record.projectionType === "ALL" ||
-      record.projectionType === "KEYS_ONLY" ||
-      record.projectionType === "INCLUDE"
-        ? record.projectionType
-        : undefined;
-
-    return {
-      indexName: typeof record.indexName === "string" ? record.indexName : "",
-      partitionKey: parseAttribute(record.partitionKey, "S"),
-      sortKey: record.sortKey ? parseAttribute(record.sortKey, "S") : undefined,
-      projectionType,
-      nonKeyAttributes: toArrayOfStrings(record.nonKeyAttributes),
-      provisionedThroughput: parseProvisionedThroughput(
-        record.provisionedThroughput
-      ),
-    };
-  });
-};
-
-const parseProperties = (
-  props: Record<string, unknown>
-): GSIManagerProps => {
-  const tableNameSource =
-    typeof props.tableName === "string"
-      ? props.tableName
-      : props.TableName;
-
-  return {
-    tableName: typeof tableNameSource === "string" ? tableNameSource : "",
-    globalSecondaryIndexes: parseGsiConfigs(
-      props.globalSecondaryIndexes ?? props.GlobalSecondaryIndexes
-    ),
-    errorHandling:
-      props.errorHandling && typeof props.errorHandling === "object"
-        ? (props.errorHandling as Partial<ErrorHandlingConfig>)
-        : undefined,
-  };
-};
-
 /**
- * 操作を開始（待機なし）
- * テーブルがACTIVEになるまで待機してから操作を開始する
+ * GSI 操作を開始（完了を待機しない）
+ *
+ * テーブルが ACTIVE 状態になるまで待機してから操作を開始しますが、
+ * GSI のステータス変更完了は待ちません。
+ *
+ * @param tableName - 対象テーブル名
+ * @param operation - 実行する GSI 操作
+ * @param service - DynamoDB GSI サービスインスタンス
+ * @throws 必須の構成が欠けている場合、または不明な操作タイプの場合にエラーをスロー
  */
 const startOperation = async (
   tableName: string,
   operation: GSIOperation,
   service: DynamoDBGSIServiceImpl
 ): Promise<void> => {
-  // テーブルがACTIVEになるまで待機（必須）
+  // テーブルが ACTIVE になるまで待機（必須前提条件）
   await service.waitForTableActive(tableName);
 
   switch (operation.type) {
@@ -169,12 +84,20 @@ const startOperation = async (
       break;
 
     default:
+      // TypeScript の exhaustiveness チェックにより、すべての操作タイプが処理されることを保証
       throw new Error(`Unknown operation type for ${operation.indexName}`);
   }
 };
 
 /**
- * 操作が完了しているか確認
+ * GSI 操作が完了しているか確認
+ *
+ * テーブルが ACTIVE 状態であり、かつ GSI が目標のステータスに達しているかを確認します。
+ *
+ * @param tableName - 対象テーブル名
+ * @param operation - 確認する GSI 操作
+ * @param service - DynamoDB GSI サービスインスタンス
+ * @returns 操作が完了している場合は true、それ以外は false
  */
 const checkOperationComplete = async (
   tableName: string,
@@ -186,18 +109,33 @@ const checkOperationComplete = async (
     return false;
   }
 
+  // DELETE の場合は DELETED、それ以外（CREATE, UPDATE）は ACTIVE を待つ
   const targetStatus = operation.type === "DELETE" ? "DELETED" : "ACTIVE";
   return await service.isGSIInStatus(tableName, operation.indexName, targetStatus);
 };
 
 /**
  * CloudFormation カスタムリソースの isComplete ハンドラー
- * ResourceProperties から操作計画を再計算し、未完了の操作を実行
+ *
+ * CloudFormation Provider Framework により定期的に呼び出され、
+ * GSI 操作の完了状態を確認します。
+ *
+ * 主な処理フロー：
+ * 1. 現在のテーブル状態を取得
+ * 2. 操作計画を再計算（べき等性の確保）
+ * 3. 進行中の操作がある場合は完了を待機
+ * 4. 未完了の操作がある場合は次の操作を開始
+ * 5. すべて完了している場合は IsComplete=true を返す
+ *
+ * DynamoDB の制限により、同時に実行できる GSI 操作は1つだけです。
+ *
+ * @param event - isComplete イベント（ResourceProperties を含む）
+ * @returns 完了状態を示すレスポンス
  */
 export const isCompleteHandler = async (
   event: IsCompleteEvent
 ): Promise<IsCompleteResponse> => {
-  const props = parseProperties(event.ResourceProperties);
+  const props = parseManagerProps(event.ResourceProperties);
   const service = new DynamoDBGSIServiceImpl({
     client,
     errorHandling: mergeErrorHandlingConfig(props.errorHandling)
@@ -205,16 +143,17 @@ export const isCompleteHandler = async (
 
   console.log(`[GSI Manager][isComplete] Checking operations for table ${props.tableName}`);
 
-  // 現在の GSI 状態を取得
+  // Update の場合、削除された GSI を検出するために以前のプロパティも考慮
   const oldProps =
     event.RequestType === "Update" && event.OldResourceProperties
-      ? parseProperties(event.OldResourceProperties)
+      ? parseManagerProps(event.OldResourceProperties)
       : undefined;
   const managedNames = collectManagedNames(
     props.globalSecondaryIndexes,
     oldProps?.globalSecondaryIndexes
   );
 
+  // 現在の GSI 状態を取得し、管理対象を解決
   const current = await service.getCurrentGSIs(props.tableName);
   const {
     candidates: managedCurrent,
@@ -227,12 +166,12 @@ export const isCompleteHandler = async (
     );
   }
 
-  // Delete の場合は、管理対象のGSIを1つずつ削除
+  // Delete リクエストの処理：管理対象の GSI を1つずつ削除
   if (event.RequestType === "Delete") {
     const existingManaged = managedCurrent;
 
     if (existingManaged.length === 0) {
-      // すべて削除済み
+      // すべての GSI が削除完了
       console.log(`[GSI Manager][isComplete] All GSIs deleted`);
       return {
         IsComplete: true,
@@ -243,8 +182,8 @@ export const isCompleteHandler = async (
       };
     }
 
-    // DynamoDB制限: 1度に1つのGSI操作のみ
-    // 最初の管理対象GSIを処理
+    // DynamoDB 制限: 同時に1つの GSI 操作のみ可能
+    // 最初の管理対象 GSI から処理を開始
     const gsi = existingManaged[0];
     console.log(`[GSI Manager][isComplete] Checking deletion of ${gsi.indexName} (${existingManaged.length} GSIs remaining)`);
 
@@ -415,52 +354,4 @@ export const isCompleteHandler = async (
 
   // 想定外の操作タイプ
   throw new Error(`Unknown operation type: ${operation.type}`);
-};
-const collectManagedNames = (
-  desired: GSIConfiguration[],
-  prior?: GSIConfiguration[]
-): Set<string> => {
-  const names = new Set<string>();
-  desired.forEach((gsi) => names.add(gsi.indexName));
-  prior?.forEach((gsi) => names.add(gsi.indexName));
-  return names;
-};
-
-const resolveCurrentForPlanning = (
-  requestType: IsCompleteEvent["RequestType"],
-  current: GSIInfo[],
-  managedNames: Set<string>
-): {
-  candidates: GSIInfo[];
-  adoptedLegacyIndexes: boolean;
-  untrackedCount: number;
-} => {
-  if (managedNames.size === 0) {
-    return {
-      candidates: current,
-      adoptedLegacyIndexes: requestType !== "Create" && current.length > 0,
-      untrackedCount: current.length,
-    };
-  }
-
-  const tracked: GSIInfo[] = [];
-  const untracked: GSIInfo[] = [];
-
-  for (const gsi of current) {
-    if (managedNames.has(gsi.indexName)) {
-      tracked.push(gsi);
-    } else {
-      untracked.push(gsi);
-    }
-  }
-
-  const shouldAdopt =
-    (requestType === "Update" || requestType === "Delete") &&
-    untracked.length > 0;
-
-  return {
-    candidates: shouldAdopt ? current : tracked,
-    adoptedLegacyIndexes: shouldAdopt,
-    untrackedCount: untracked.length,
-  };
 };
