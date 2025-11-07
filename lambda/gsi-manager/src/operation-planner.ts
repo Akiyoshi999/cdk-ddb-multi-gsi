@@ -83,7 +83,7 @@ const shouldUpdateThroughput = (
 
   const currentThroughput = current.provisionedThroughput;
   if (!currentThroughput) {
-    return true;
+    return false;
   }
 
   return (
